@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="토익 오답노트"/>
+<meta name="theme-color" content="#0a0a0f"/>
+<title>토익 오답노트</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+
+<script src="https://unpkg.com/recharts@2.8.0/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+  body{background:#0a0a0f;color:#e8e8f0;font-family:'Pretendard','Noto Sans KR',system-ui,sans-serif;overscroll-behavior:none;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  select option{background:#1a1a2e;color:#e8e8f0;}
+  ::-webkit-scrollbar{width:4px;height:4px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  ::-webkit-scrollbar-thumb{background:#ffffff20;border-radius:2px;}
+  input,textarea,select{-webkit-appearance:none;appearance:none;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useReducer, useRef, useMemo, useCallback, useEffect } = React;
+const { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, CartesianGrid } = Recharts;
+
+const API_URL = "https://api.anthropic.com/v1/messages";
+const MODEL   = "claude-sonnet-4-20250514";
+const LS_KEY  = "toeic_odaq_v5";
+
+const LC_PARTS = {
+  PART1:{label:"Part 1",sub:"사진묘사"},PART2:{label:"Part 2",sub:"응답"},
+  PART3:{label:"Part 3",sub:"대화"},   PART4:{label:"Part 4",sub:"설명문"},
+};
+const RC_PARTS = {
+  PART5:{label:"Part 5",sub:"단문공란"},PART6:{label:"Part 6",sub:"장문공란"},
+  PART7:{label:"Part 7",sub:"독해"},
+};
+const ALL_PARTS = {...LC_PARTS,...RC_PARTS};
+const LC_TYPES = [
+  {key:"vocab",label:"어휘", color:"#6366f1",emoji:"📖"},
+  {key:"sound",label:"발음", color:"#f59e0b",emoji:"🔊"},
+  {key:"logic",label:"풀이", color:"#10b981",emoji:"🧠"},
+];
+const RC_TYPES = [
+  {key:"noun",     label:"명사",      color:"#6366f1"},{key:"pronoun",  label:"대명사",    color:"#8b5cf6"},
+  {key:"verb",     label:"동사형태",  color:"#ec4899"},{key:"tense",    label:"시제",      color:"#f59e0b"},
+  {key:"voice",    label:"태(수동)",  color:"#ef4444"},{key:"nonfinite",label:"준동사",    color:"#f97316"},
+  {key:"adj_adv",  label:"형용사/부사",color:"#14b8a6"},{key:"prep",    label:"전치사",    color:"#06b6d4"},
+  {key:"conj",     label:"접속사",    color:"#3b82f6"},{key:"rel",      label:"관계사",    color:"#10b981"},
+  {key:"vocab_rc", label:"어휘",      color:"#84cc16"},{key:"context",  label:"문맥/흐름", color:"#a78bfa"},
+];
+const BASE_INTERVALS = [1,3,7,14];
+const isLC      = k => !!LC_PARTS[k];
+const partColor = k => isLC(k)?"#6366f1":"#f59e0b";
+const typeList  = k => isLC(k)?LC_TYPES:RC_TYPES;
+
+const toDateStr = d  => d.toISOString().split("T")[0];
+const todayStr  = () => toDateStr(new Date());
+const addDays   = (str,n) => { const d=new Date(str); d.setDate(d.getDate()+n); return toDateStr(d); };
+const fmtDate   = str => { const d=new Date(str); return `${d.getMonth()+1}/${d.getDate()}`; };
+const todayKr   = () => new Date().toLocaleDateString("ko-KR");
+
+function makeReviews(dateStr) {
+  return BASE_INTERVALS.map(n=>({due:addDays(dateStr,n),done:false,doneDate:null,result:null,interval:n}));
+}
+
+function formatQuestionText(text) {
+  if(!text) return text;
+  return text
+    .replace(/\[정답[^\]]*\]/g,"")
+    .replace(/\s*\(A\)/g,"\n\n(A)")
+    .replace(/\s*\(B\)/g,"\n(B)")
+    .replace(/\s*\(C\)/g,"\n(C)")
+    .replace(/\s*\(D\)/g,"\n(D)")
+    .trim();
+}
+
+const lsLoad = () => { try{const r=localStorage.getItem(LS_KEY);return r?JSON.parse(r):[];}catch{return[];} };
+const lsSave = d => { try{localStorage.setItem(LS_KEY,JSON.stringify(d));}catch{} };
+const toB64  = f => new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(",")[1]);r.onerror=rej;r.readAsDataURL(f);});
+const uid    = () => Math.random().toString(36).slice(2,10);
+const parseNums = str => {
+  const nums=[];
+  str.split(",").forEach(t=>{t=t.trim();if(t.includes("-")){const[a,b]=t.split("-").map(Number);for(let i=a;i<=b;i++)nums.push(i);}else if(!isNaN(t)&&t)nums.push(Number(t));});
+  return [...new Set(nums)].sort((a,b)=>a-b);
+};
+
+async function extractByVision(b64,mtype,nums) {
+  let res;
+  try {
+    res = await fetch(API_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      model:MODEL,max_tokens:1500,
+      messages:[{role:"user",content:[
+        {type:"image",source:{type:"base64",media_type:mtype,data:b64}},
+        {type:"text",text:`토익 문제집 이미지에서 번호 ${nums.join(",")}번 문제를 추출하세요.\n\n규칙:\n- 문제 지문과 선택지(A)(B)(C)(D)를 모두 포함\n- 선택지는 반드시 각각 줄바꿈으로 구분\n- 정답, 해설, 정답 표시(동그라미/체크 등)는 절대 포함하지 말 것\n\n출력: JSON만, 마크다운 없이\n{"questions":[{"num":번호,"text":"문제지문\\n\\n(A) ...\\n(B) ...\\n(C) ...\\n(D) ..."}]}\n찾지 못하면 {"questions":[]}`},
+      ]}],
+    })});
+  } catch(e){throw new Error(`네트워크 오류: ${e.message}`);}
+  if(!res.ok){const t=await res.text().catch(()=>"");throw new Error(`API 오류 ${res.status}: ${t.slice(0,100)}`);}
+  let data;
+  try{data=await res.json();}catch{throw new Error("API 응답 파싱 실패");}
+  if(!data.content?.length) throw new Error("API 응답이 비어있어요");
+  const raw=data.content.map(b=>b.type==="text"?b.text:"").join("").replace(/```json[\s\S]*?```/g,m=>m.slice(7,-3)).replace(/```/g,"").trim();
+  let parsed;
+  try{parsed=JSON.parse(raw);}catch{const m=raw.match(/\{[\s\S]*\}/);if(m){try{parsed=JSON.parse(m[0]);}catch{throw new Error("JSON 파싱 실패");}}else throw new Error("JSON 파싱 실패");}
+  if(!Array.isArray(parsed?.questions)) throw new Error("questions 배열이 없어요");
+  parsed.questions=parsed.questions.map(q=>({...q,text:formatQuestionText(q.text)}));
+  return parsed;
+}
+
+function reducer(state,action){
+  let next;
+  switch(action.type){
+    case "ADD":    next=[...state,...action.items]; break;
+    case "DELETE": next=state.filter(n=>n.id!==action.id); break;
+    case "UPDATE": next=state.map(n=>n.id===action.id?{...n,...action.patch}:n); break;
+    case "MARK_REVIEW":{
+      const {id,idx,result}=action;
+      next=state.map(n=>{
+        if(n.id!==id) return n;
+        const reviews=n.reviews.map((r,i)=>i!==idx?r:{...r,done:true,doneDate:todayStr(),result});
+        if(result==="forget") reviews.push({due:addDays(todayStr(),1),done:false,doneDate:null,result:null,interval:1,retry:true});
+        return {...n,reviews};
+      });
+      break;
+    }
+    default: next=state;
+  }
+  lsSave(next);
+  return next;
+}
+
+function App() {
+  const [notes,dispatch]=useReducer(reducer,null,()=>lsLoad());
+  const [tab,setTab]=useState("review");
+  const [filterExam,setFilterExam]=useState("all");
+  const [filterPart,setFilterPart]=useState("all");
+  const [filterTypes,setFilterTypes]=useState([]);
+  const today=todayStr();
+
+  const addNotes  =useCallback(items=>{dispatch({type:"ADD",items});setTab("list");},[]);
+  const deleteNote=useCallback(id=>dispatch({type:"DELETE",id}),[]);
+  const updateNote=useCallback((id,patch)=>dispatch({type:"UPDATE",id,patch}),[]);
+  const markReview=useCallback((id,idx,result)=>dispatch({type:"MARK_REVIEW",id,idx,result}),[]);
+
+  const exams=useMemo(()=>[...new Set(notes.map(n=>n.exam))].sort((a,b)=>Number(a)-Number(b)),[notes]);
+
+  const {dueToday,overdue}=useMemo(()=>{
+    const dt=[],od=[];
+    notes.forEach(n=>(n.reviews||[]).forEach((r,i)=>{
+      if(r.done) return;
+      if(r.due===today) dt.push({note:n,idx:i,r});
+      else if(r.due<today) od.push({note:n,idx:i,r});
+    }));
+    return {dueToday:dt,overdue:od};
+  },[notes,today]);
+  const totalDue=dueToday.length+overdue.length;
+
+  const grouped=useMemo(()=>{
+    const filtered=notes.filter(n=>{
+      if(filterExam!=="all"&&n.exam!==filterExam) return false;
+      if(filterPart!=="all"&&n.partKey!==filterPart) return false;
+      if(filterTypes.length>0&&!filterTypes.every(t=>(n.types||[]).includes(t))) return false;
+      return true;
+    });
+    const g={};
+    filtered.forEach(n=>{
+      if(!g[n.exam]) g[n.exam]={};
+      if(!g[n.exam][n.partKey]) g[n.exam][n.partKey]=[];
+      g[n.exam][n.partKey].push(n);
+    });
+    Object.values(g).forEach(p=>Object.values(p).forEach(a=>a.sort((a,b)=>a.num-b.num)));
+    return g;
+  },[notes,filterExam,filterPart,filterTypes]);
+
+  const shownTypes=filterPart==="all"?[]:isLC(filterPart)?LC_TYPES:RC_TYPES;
+  const toggleFT=key=>setFilterTypes(p=>p.includes(key)?p.filter(k=>k!==key):[...p,key]);
+
+  const TABS=[
+    {key:"review",label:`복습${totalDue>0?` (${totalDue})`:""}`,icon:"🔁"},
+    {key:"list",  label:"오답목록",icon:"📋"},
+    {key:"add",   label:"추가",   icon:"➕"},
+    {key:"stats", label:"통계",   icon:"📊"},
+  ];
+
+  return (
+    <div style={s.root}>
+      <div style={s.hdr}>
+        <div style={s.hdrIn}>
+          <div>
+            <div style={{fontSize:10,letterSpacing:4,color:"#6366f180",marginBottom:3}}>TOEIC WRONG NOTE</div>
+            <div style={{fontSize:19,fontWeight:800}}>📝 오답노트</div>
+          </div>
+          <Chip label={`${notes.length}문제`} color="#6366f1"/>
+        </div>
+      </div>
+
+      {totalDue>0&&tab!=="review"&&(
+        <button onClick={()=>setTab("review")} style={{display:"flex",justifyContent:"space-between",alignItems:"center",width:"100%",background:"linear-gradient(90deg,#e9456018,#f59e0b18)",border:"none",borderBottom:"1px solid #f59e0b30",padding:"10px 16px",cursor:"pointer",color:"#f59e0b"}}>
+          <span style={{fontSize:13,fontWeight:600}}>🔁 오늘 복습할 문제 {totalDue}개 있어요!</span>
+          <span style={{fontSize:11,opacity:0.6}}>보러가기 →</span>
+        </button>
+      )}
+
+      <div style={s.tabBar}>
+        {TABS.map(t=>(
+          <button key={t.key} onClick={()=>setTab(t.key)} style={{...s.tabBtn,borderBottom:`2px solid ${tab===t.key?"#6366f1":"transparent"}`,color:tab===t.key?"#e8e8f0":"#ffffff40",fontWeight:tab===t.key?700:400}}>
+            <span style={{fontSize:14}}>{t.icon}</span>
+            <span style={{fontSize:11}}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div style={s.body}>
+        {tab==="review"&&<ReviewTab dueToday={dueToday} overdue={overdue} onMark={markReview} notes={notes}/>}
+        {tab==="list"&&(
+          <>
+            <div style={{marginBottom:14}}>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+                <select value={filterExam} onChange={e=>{setFilterExam(e.target.value);setFilterTypes([]);}} style={s.sel}>
+                  <option value="all">전체 회차</option>
+                  {exams.map(e=><option key={e} value={e}>{e}회</option>)}
+                </select>
+                <select value={filterPart} onChange={e=>{setFilterPart(e.target.value);setFilterTypes([]);}} style={s.sel}>
+                  <option value="all">전체 파트</option>
+                  <optgroup label="── LC">{Object.entries(LC_PARTS).map(([k,v])=><option key={k} value={k}>{v.label} {v.sub}</option>)}</optgroup>
+                  <optgroup label="── RC">{Object.entries(RC_PARTS).map(([k,v])=><option key={k} value={k}>{v.label} {v.sub}</option>)}</optgroup>
+                </select>
+              </div>
+              {shownTypes.length>0&&(
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {shownTypes.map(t=>{const on=filterTypes.includes(t.key);return <button key={t.key} onClick={()=>toggleFT(t.key)} style={{padding:"4px 10px",borderRadius:20,fontSize:11,cursor:"pointer",border:`1px solid ${on?t.color:t.color+"40"}`,background:on?t.color+"30":"transparent",color:on?t.color:t.color+"80",fontWeight:on?700:400}}>{"emoji" in t?`${t.emoji} `:""}{t.label}</button>;})}
+                  {filterTypes.length>0&&<button onClick={()=>setFilterTypes([])} style={{padding:"4px 10px",borderRadius:20,fontSize:11,cursor:"pointer",border:"1px solid #ffffff20",background:"transparent",color:"#ffffff40"}}>초기화</button>}
+                </div>
+              )}
+            </div>
+            <ListView grouped={grouped} onDelete={deleteNote} onUpdate={updateNote}/>
+          </>
+        )}
+        {tab==="add"&&<AddForm onAdd={addNotes} exams={exams}/>}
+        {tab==="stats"&&<StatsTab notes={notes}/>}
+      </div>
+    </div>
+  );
+}
+
+function ReviewTab({dueToday,overdue,onMark,notes}) {
+  const today=todayStr();
+  const upcoming=useMemo(()=>{
+    const res=[];
+    for(let i=1;i<=7;i++){
+      const d=addDays(today,i);
+      const items=[];
+      notes.forEach(n=>(n.reviews||[]).forEach((r,idx)=>{if(!r.done&&r.due===d)items.push({note:n,idx,r});}));
+      if(items.length) res.push({date:d,items});
+    }
+    return res;
+  },[notes,today]);
+  const empty=dueToday.length===0&&overdue.length===0;
+  return (
+    <div>
+      {empty&&upcoming.length===0&&<div style={s.empty}><div style={{fontSize:36,marginBottom:10}}>✨</div>오늘 복습할 문제가 없어요!<br/><span style={{fontSize:12,color:"#ffffff25"}}>오답 추가 시 SRS 일정이 자동 생성돼요.</span></div>}
+      {overdue.length>0&&<Sec title={`⚠️ 밀린 복습 (${overdue.length}개)`} color="#e94560">{overdue.map(({note,idx,r})=><ReviewCard key={`${note.id}-${idx}`} note={note} r={r} idx={idx} onMark={onMark} overdue/>)}</Sec>}
+      {dueToday.length>0&&<Sec title={`🔁 오늘 복습 (${dueToday.length}개)`} color="#f59e0b">{dueToday.map(({note,idx,r})=><ReviewCard key={`${note.id}-${idx}`} note={note} r={r} idx={idx} onMark={onMark}/>)}</Sec>}
+      {upcoming.length>0&&(
+        <Sec title="📅 향후 7일 예정" color="#ffffff30">
+          {upcoming.map(({date,items})=>(
+            <div key={date} style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:"#6366f1",marginBottom:6}}>{fmtDate(date)} — {items.length}개</div>
+              {items.map(({note,idx})=>(
+                <div key={`${note.id}-${idx}`} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:"#ffffff05",borderRadius:8,marginBottom:4,border:"1px solid #ffffff08"}}>
+                  <span style={{fontSize:10,color:"#6366f180",background:"#6366f115",padding:"2px 7px",borderRadius:10}}>+{note.reviews[idx]?.interval??"-"}일</span>
+                  <span style={{fontSize:13,color:"#e8e8f0aa"}}>{ALL_PARTS[note.partKey]?.label} {note.num}번</span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </Sec>
+      )}
+    </div>
+  );
+}
+
+function ReviewCard({note,r,idx,onMark,overdue}) {
+  const col=partColor(note.partKey);
+  const [open,setOpen]=useState(false);
+  const types=note.types||[];
+  const allTypes=typeList(note.partKey);
+  return (
+    <div style={{background:overdue?"#e9456008":"#ffffff05",border:`1px solid ${overdue?"#e9456030":col+"25"}`,borderLeft:`3px solid ${overdue?"#e94560":col}`,borderRadius:8,marginBottom:6,overflow:"hidden"}}>
+      <div style={{display:"flex",alignItems:"center",padding:"10px 12px",gap:10}}>
+        <span style={{width:26,height:26,borderRadius:"50%",background:col+"25",color:col,fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{note.num}</span>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:12,color:"#e8e8f0aa",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ALL_PARTS[note.partKey]?.label} · {note.exam}회차</div>
+          {types.length>0&&<div style={{display:"flex",gap:3,marginTop:2,flexWrap:"wrap"}}>{types.map(tk=>{const t=allTypes.find(x=>x.key===tk);return t?<span key={tk} style={{fontSize:9,padding:"1px 5px",borderRadius:10,background:t.color+"25",color:t.color}}>{"emoji" in t?`${t.emoji} `:""}{t.label}</span>:null;})}</div>}
+        </div>
+        <button onClick={()=>setOpen(p=>!p)} style={{fontSize:10,color:"#ffffff40",background:"#ffffff08",border:"none",borderRadius:6,padding:"4px 8px",cursor:"pointer",flexShrink:0}}>문제{open?"▲":"▼"}</button>
+      </div>
+      {open&&(
+        <div style={{padding:"0 12px 10px"}}>
+          {note.section==="RC"&&<pre style={s.qText}>{note.text}</pre>}
+          {note.memo&&<div style={{background:"#6366f110",borderRadius:8,padding:"8px 10px",fontSize:13,color:"#e8e8f0aa",lineHeight:1.7,marginBottom:10}}>{note.memo}</div>}
+          <div style={{fontSize:11,color:"#ffffff40",marginBottom:6}}>복습 결과</div>
+          <div style={{display:"flex",gap:6}}>
+            {[{key:"know",label:"✅ 알았어요",col:"#10b981"},{key:"unsure",label:"🤔 애매해요",col:"#f59e0b"},{key:"forget",label:"❌ 몰랐어요",col:"#e94560"}].map(b=>(
+              <button key={b.key} onClick={()=>onMark(note.id,idx,b.key)} style={{flex:1,padding:"8px 4px",borderRadius:8,border:`1px solid ${b.col}40`,background:b.col+"18",color:b.col,fontSize:11,fontWeight:700,cursor:"pointer"}}>{b.label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ListView({grouped,onDelete,onUpdate}) {
+  const [expanded,setExpanded]=useState({});
+  const tog=k=>setExpanded(p=>({...p,[k]:!p[k]}));
+  const exams=Object.keys(grouped).sort((a,b)=>Number(a)-Number(b));
+  if(!exams.length) return <div style={s.empty}><div style={{fontSize:36,marginBottom:10}}>📭</div>오답노트가 비어있어요.<br/><span style={{fontSize:12,color:"#ffffff25"}}>추가 탭에서 시작하세요.</span></div>;
+  return (
+    <div>
+      {exams.map(exam=>(
+        <div key={exam} style={{marginBottom:12}}>
+          <button onClick={()=>tog(`e_${exam}`)} style={s.examRow}>
+            <span style={{fontSize:14,fontWeight:700}}>📄 {exam}회차</span>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}><Chip label={`${Object.values(grouped[exam]).flat().length}문제`} color="#6366f1"/><span style={{color:"#ffffff30",fontSize:11}}>{expanded[`e_${exam}`]===false?"▼":"▲"}</span></div>
+          </button>
+          {expanded[`e_${exam}`]!==false&&Object.entries(grouped[exam]).map(([pk,items])=>{
+            const col=partColor(pk);const pkey=`${exam}_${pk}`;
+            return (
+              <div key={pk} style={{marginBottom:5}}>
+                <button onClick={()=>tog(pkey)} style={{...s.partRow,borderColor:col+"40",background:col+"10"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontSize:10,padding:"2px 7px",borderRadius:10,background:col+"25",color:col,fontWeight:700}}>{isLC(pk)?"LC":"RC"}</span>
+                    <span style={{fontSize:12,fontWeight:600,color:col}}>{ALL_PARTS[pk].label} · {ALL_PARTS[pk].sub}</span>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}><Chip label={`${items.length}문제`} color={col}/><span style={{color:"#ffffff25",fontSize:11}}>{expanded[pkey]?"▲":"▼"}</span></div>
+                </button>
+                {expanded[pkey]&&items.map(note=><NoteCard key={note.id} note={note} col={col} onDelete={onDelete} onUpdate={onUpdate}/>)}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NoteCard({note,col,onDelete,onUpdate}) {
+  const [open,setOpen]=useState(false);
+  const [editMemo,setEditMemo]=useState(false);
+  const [memoVal,setMemoVal]=useState(note.memo||"");
+  const taRef=useRef();
+  const types=note.types||[];
+  const allTypes=typeList(note.partKey);
+  const reviews=note.reviews||[];
+  const doneCount=reviews.filter(r=>r.done&&!r.retry).length;
+  useEffect(()=>{if(editMemo&&taRef.current){taRef.current.style.height="auto";taRef.current.style.height=taRef.current.scrollHeight+"px";}},[editMemo,memoVal]);
+  return (
+    <div style={{background:"#ffffff05",border:`1px solid ${col}25`,borderLeft:`3px solid ${col}`,borderRadius:8,marginBottom:4,overflow:"hidden"}}>
+      <button onClick={()=>setOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",cursor:"pointer",color:"#e8e8f0",textAlign:"left"}}>
+        <div style={{display:"flex",alignItems:"center",gap:9,flex:1,minWidth:0}}>
+          <span style={{width:24,height:24,borderRadius:"50%",background:col+"25",color:col,fontSize:11,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{note.num}</span>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:12,color:"#e8e8f0aa",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{note.section==="LC"?`LC ${note.num}번`:note.text.slice(0,30)+(note.text.length>30?"…":"")}</div>
+            {types.length>0&&<div style={{display:"flex",gap:3,marginTop:2,flexWrap:"wrap"}}>{types.map(tk=>{const t=allTypes.find(x=>x.key===tk);return t?<span key={tk} style={{fontSize:9,padding:"1px 5px",borderRadius:10,background:t.color+"25",color:t.color}}>{"emoji" in t?`${t.emoji} `:""}{t.label}</span>:null;})}</div>}
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+          <span style={{fontSize:10,color:doneCount>=4?"#10b981":"#ffffff30"}}>{doneCount}/4</span>
+          <span style={{color:"#ffffff25",fontSize:11}}>{open?"▲":"▼"}</span>
+        </div>
+      </button>
+      {open&&(
+        <div style={{padding:"0 12px 12px"}}>
+          {note.section==="RC"&&<pre style={{...s.qText,marginBottom:10}}>{note.text}</pre>}
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,color:"#ffffff40",marginBottom:6}}>복습 진행 (SRS)</div>
+            <div style={{display:"flex",gap:5,overflowX:"auto",paddingBottom:4}}>
+              {reviews.filter(r=>!r.retry).map((r,i)=>{
+                const rc={know:"#10b981",unsure:"#f59e0b",forget:"#e94560"}[r.result]||"#ffffff20";
+                return <div key={i} style={{flexShrink:0,minWidth:52,textAlign:"center",padding:"6px 4px",borderRadius:8,background:r.done?rc+"18":"#ffffff08",border:`1px solid ${r.done?rc+"50":"#ffffff10"}`}}><div style={{fontSize:10,color:r.done?rc:"#ffffff40",fontWeight:700}}>+{r.interval??BASE_INTERVALS[i]}일</div><div style={{fontSize:9,color:r.done?rc+"aa":"#ffffff25",marginTop:2}}>{r.done?({know:"✅",unsure:"🤔",forget:"❌"}[r.result]||"✓"):fmtDate(r.due)}</div></div>;
+              })}
+            </div>
+          </div>
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:11,color:"#ffffff40",marginBottom:6}}>오류 유형</div>
+            <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{allTypes.map(t=>{const on=types.includes(t.key);return <button key={t.key} onClick={()=>{const next=on?types.filter(k=>k!==t.key):[...types,t.key];onUpdate(note.id,{types:next});}} style={{padding:"4px 8px",borderRadius:20,fontSize:11,cursor:"pointer",border:`1px solid ${on?t.color:t.color+"35"}`,background:on?t.color+"25":"transparent",color:on?t.color:t.color+"60",fontWeight:on?700:400}}>{"emoji" in t?`${t.emoji} `:""}{t.label}</button>;})}</div>
+          </div>
+          <div style={{marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}><span style={{fontSize:11,color:"#ffffff40"}}>메모</span><button onClick={()=>{setEditMemo(p=>!p);setMemoVal(note.memo||"");}} style={{fontSize:10,color:"#6366f1",background:"none",border:"none",cursor:"pointer",padding:0}}>{editMemo?"취소":"✏️ 편집"}</button></div>
+            {editMemo?(<div><textarea ref={taRef} value={memoVal} onChange={e=>{setMemoVal(e.target.value);taRef.current.style.height="auto";taRef.current.style.height=taRef.current.scrollHeight+"px";}} style={{...s.inp,resize:"none",lineHeight:1.6,marginBottom:6,overflow:"hidden",minHeight:60}}/><button onClick={()=>{onUpdate(note.id,{memo:memoVal});setEditMemo(false);}} style={{...s.btn,background:"#6366f1",fontSize:12,padding:"5px 12px",borderRadius:7}}>저장</button></div>)
+            :note.memo?<div style={{background:"#ffffff08",borderRadius:8,padding:"8px 10px",fontSize:13,color:"#e8e8f0aa",lineHeight:1.7,whiteSpace:"pre-wrap"}}>{note.memo}</div>
+            :<div style={{fontSize:12,color:"#ffffff20",fontStyle:"italic"}}>메모 없음</div>}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontSize:10,color:"#ffffff25"}}>{note.date}</span>
+            <button onClick={()=>onDelete(note.id)} style={{fontSize:11,color:"#e94560",background:"#e9456015",border:"1px solid #e9456030",borderRadius:6,padding:"4px 10px",cursor:"pointer"}}>삭제</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddForm({onAdd,exams}) {
+  const [examMode,setExamMode]=useState(exams.length>0?"existing":"new");
+  const [selectedExam,setSelectedExam]=useState(exams[0]||"");
+  const [newExam,setNewExam]=useState("");
+  const [section,setSection]=useState("LC");
+  const [partKey,setPartKey]=useState("PART1");
+  const [numInput,setNumInput]=useState("");
+  const [types,setTypes]=useState([]);
+  const [memo,setMemo]=useState("");
+  const [images,setImages]=useState([]);
+  const [status,setStatus]=useState(null);
+  const [rcInputMode,setRcInputMode]=useState("image"); // "image"|"text"
+  const [rcTextInputs,setRcTextInputs]=useState({}); // {번호: 텍스트}
+  const fileRef=useRef();
+  const sectionParts=section==="LC"?LC_PARTS:RC_PARTS;
+  const sectionTypes=section==="LC"?LC_TYPES:RC_TYPES;
+  const toggleType=key=>setTypes(p=>p.includes(key)?p.filter(k=>k!==key):[...p,key]);
+  const examValue=examMode==="existing"?selectedExam:newExam;
+
+  async function handleFiles(files){
+    const arr=[];
+    for(const f of files){const b64=await toB64(f);arr.push({base64:b64,mtype:f.type||"image/jpeg",preview:URL.createObjectURL(f)});}
+    setImages(p=>[...p,...arr]);
+  }
+  async function handleSubmit(){
+    if(!examValue.trim()){setStatus("error:회차를 입력하거나 선택하세요");return;}
+    const nums=parseNums(numInput);
+    if(!nums.length){setStatus("error:번호를 입력하세요 (예: 1,3,5-7)");return;}
+    const td=todayStr();
+    if(section==="LC"){onAdd(nums.map(num=>({id:uid(),exam:examValue.trim(),partKey,num,text:`LC ${num}번 문제`,types,memo,date:todayKr(),section:"LC",reviews:makeReviews(td)})));return;}
+    // RC 텍스트 직접 입력 모드
+    if(rcInputMode==="text"){
+      const results=nums.map(num=>({id:uid(),exam:examValue.trim(),partKey,num,text:rcTextInputs[num]||`RC ${num}번 문제`,types,memo,date:todayKr(),section:"RC",reviews:makeReviews(td)}));
+      onAdd(results);
+      return;
+    }
+    if(!images.length){setStatus("error:이미지를 업로드하세요");return;}
+    setStatus("loading");
+    try{
+      const results=[];
+      for(const img of images){const {questions}=await extractByVision(img.base64,img.mtype,nums);questions.forEach(q=>results.push({id:uid(),exam:examValue.trim(),partKey,num:q.num,text:q.text,types,memo,date:todayKr(),section:"RC",reviews:makeReviews(td)}));}
+      if(!results.length){setStatus("error:이미지에서 번호를 찾지 못했어요");return;}
+      setStatus(`done:${results.length}문제 추출 완료!`);
+      setTimeout(()=>onAdd(results),800);
+    }catch(e){setStatus(`error:${e.message||"추출 실패"}`);}
+  }
+  const isLoading=status==="loading";
+  return (
+    <div style={{maxWidth:500,margin:"0 auto"}}>
+      <Sec title="① 모의고사 회차">
+        {exams.length>0&&(
+          <div style={{display:"flex",marginBottom:10,borderRadius:8,overflow:"hidden",border:"1px solid #ffffff15"}}>
+            {[{key:"existing",label:"기존 회차 선택"},{key:"new",label:"새 회차 입력"}].map(m=>(
+              <button key={m.key} onClick={()=>setExamMode(m.key)} style={{flex:1,padding:"8px",border:"none",background:examMode===m.key?"#6366f130":"transparent",color:examMode===m.key?"#6366f1":"#ffffff40",fontWeight:examMode===m.key?700:400,fontSize:12,cursor:"pointer",borderRight:m.key==="existing"?"1px solid #ffffff15":"none"}}>{m.label}</button>
+            ))}
+          </div>
+        )}
+        {examMode==="existing"&&exams.length>0?(
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {exams.map(e=>{const on=selectedExam===e;return <button key={e} onClick={()=>setSelectedExam(e)} style={{padding:"7px 14px",borderRadius:20,fontSize:13,cursor:"pointer",border:`1px solid ${on?"#6366f1":"#ffffff20"}`,background:on?"#6366f130":"transparent",color:on?"#6366f1":"#ffffff60",fontWeight:on?700:400}}>{e}회차</button>;})}
+          </div>
+        ):(
+          <input value={newExam} onChange={e=>setNewExam(e.target.value)} placeholder="예: 3, 2025년 6월..." style={s.inp}/>
+        )}
+      </Sec>
+      <div style={{display:"flex",marginBottom:18,borderRadius:10,overflow:"hidden",border:"1px solid #ffffff15"}}>
+        {["LC","RC"].map(sec=>(
+          <button key={sec} onClick={()=>{setSection(sec);setPartKey(sec==="LC"?"PART1":"PART5");setTypes([]);setImages([]);}} style={{flex:1,padding:"10px",border:"none",background:section===sec?(sec==="LC"?"#6366f130":"#f59e0b30"):"transparent",color:section===sec?(sec==="LC"?"#6366f1":"#f59e0b"):"#ffffff40",fontWeight:section===sec?700:400,fontSize:14,cursor:"pointer",borderRight:sec==="LC"?"1px solid #ffffff15":"none"}}>
+            {sec==="LC"?"🎧 LC":"📖 RC"}{sec==="RC"&&<span style={{fontSize:10,color:"#ffffff40",marginLeft:5}}>이미지 필요</span>}
+          </button>
+        ))}
+      </div>
+      <Sec title="② 파트">
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{Object.entries(sectionParts).map(([k,v])=>{const col=partColor(k);const on=partKey===k;return <button key={k} onClick={()=>setPartKey(k)} style={{padding:"6px 12px",borderRadius:20,fontSize:12,cursor:"pointer",border:`1px solid ${on?col:col+"30"}`,background:on?col+"25":"transparent",color:on?col:col+"60",fontWeight:on?700:400}}>{v.label} <span style={{fontSize:10,opacity:0.7}}>{v.sub}</span></button>;})}</div>
+      </Sec>
+      <Sec title="③ 틀린 번호">
+        <input value={numInput} onChange={e=>setNumInput(e.target.value)} placeholder="예: 1, 3, 5-7" style={s.inp}/>
+        <div style={{fontSize:11,color:"#ffffff25",marginTop:4}}>범위 가능 (5-7 = 5,6,7번)</div>
+      </Sec>
+      <Sec title="④ 오류 유형 (중복 가능)">
+        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{sectionTypes.map(t=>{const on=types.includes(t.key);return <button key={t.key} onClick={()=>toggleType(t.key)} style={{padding:"5px 11px",borderRadius:20,fontSize:12,cursor:"pointer",border:`1px solid ${on?t.color:t.color+"40"}`,background:on?t.color+"30":"transparent",color:on?t.color:t.color+"70",fontWeight:on?700:400}}>{"emoji" in t?`${t.emoji} `:""}{t.label}</button>;})}</div>
+      </Sec>
+      <Sec title="⑤ 메모 (선택)">
+        <AutoTextarea value={memo} onChange={setMemo} placeholder="틀린 이유, 해설, 헷갈린 포인트..."/>
+      </Sec>
+      {section==="RC"&&(
+        <Sec title="⑥ 문제 입력 방식">
+          {/* 입력 모드 토글 */}
+          <div style={{display:"flex",marginBottom:12,borderRadius:8,overflow:"hidden",border:"1px solid #ffffff15"}}>
+            {[{key:"image",label:"📷 이미지 업로드",sub:"PC 권장"},{key:"text",label:"✏️ 텍스트 직접 입력",sub:"아이폰 권장"}].map(m=>(
+              <button key={m.key} onClick={()=>setRcInputMode(m.key)} style={{flex:1,padding:"9px 4px",border:"none",background:rcInputMode===m.key?"#f59e0b30":"transparent",color:rcInputMode===m.key?"#f59e0b":"#ffffff40",fontWeight:rcInputMode===m.key?700:400,fontSize:12,cursor:"pointer",borderRight:m.key==="image"?"1px solid #ffffff15":"none",lineHeight:1.4}}>
+                <div>{m.label}</div>
+                <div style={{fontSize:9,opacity:0.6,marginTop:2}}>{m.sub}</div>
+              </button>
+            ))}
+          </div>
+          {rcInputMode==="image"?(
+            <div>
+              <div onClick={()=>fileRef.current.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();handleFiles([...e.dataTransfer.files]);}} style={{border:"2px dashed #ffffff20",borderRadius:12,padding:"18px",textAlign:"center",cursor:"pointer",color:"#ffffff40",fontSize:13}}>
+                📎 탭하거나 드래그<br/><span style={{fontSize:11,color:"#ffffff25"}}>JPG · PNG · 추출 후 저장 안 됨</span>
+              </div>
+              <input ref={fileRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>handleFiles([...e.target.files])}/>
+              {images.length>0&&(<div style={{display:"flex",gap:8,overflowX:"auto",marginTop:8,paddingBottom:4}}>{images.map((img,i)=><div key={i} style={{position:"relative",flexShrink:0}}><img src={img.preview} alt="" style={{width:72,height:72,objectFit:"cover",borderRadius:8,border:"1px solid #ffffff20"}}/><button onClick={()=>setImages(images.filter((_,j)=>j!==i))} style={{position:"absolute",top:-5,right:-5,width:18,height:18,borderRadius:"50%",background:"#e94560",border:"none",color:"#fff",fontSize:10,cursor:"pointer",padding:0}}>✕</button></div>)}</div>)}
+            </div>
+          ):(
+            <div>
+              <div style={{fontSize:11,color:"#ffffff40",marginBottom:8}}>번호별 문제 텍스트 입력 (Claude에서 추출 후 붙여넣기)</div>
+              {parseNums(numInput).length>0?parseNums(numInput).map(num=>(
+                <div key={num} style={{marginBottom:10}}>
+                  <div style={{fontSize:12,color:"#f59e0b",marginBottom:4,fontWeight:600}}>{num}번</div>
+                  <textarea
+                    value={rcTextInputs[num]||""}
+                    onChange={e=>setRcTextInputs(p=>({...p,[num]:e.target.value}))}
+                    placeholder={`${num}번 문제 텍스트 붙여넣기...`}
+                    rows={4}
+                    style={{...s.inp,resize:"vertical",lineHeight:1.6,minHeight:80}}
+                  />
+                </div>
+              )):(
+                <div style={{padding:"14px",background:"#ffffff05",borderRadius:8,fontSize:12,color:"#ffffff30",textAlign:"center"}}>
+                  먼저 ③번에서 틀린 번호를 입력하세요
+                </div>
+              )}
+            </div>
+          )}
+        </Sec>
+      )}
+      {status?.startsWith("error:")&&<div style={{...s.toast,background:"#e9456015",borderColor:"#e9456040",color:"#e94560"}}>⚠ {status.slice(6)}</div>}
+      {status?.startsWith("done:")&&<div style={{...s.toast,background:"#10b98115",borderColor:"#10b98140",color:"#10b981"}}>✓ {status.slice(5)}</div>}
+      <button onClick={handleSubmit} disabled={isLoading} style={{...s.btn,width:"100%",padding:"13px",fontSize:14,fontWeight:700,background:isLoading?"#ffffff15":"#6366f1",borderRadius:12,marginTop:4}}>
+        {isLoading?<span>⏳ AI 추출 중...</span>:section==="LC"?"✓ 오답 추가":"🔍 AI로 문제 추출"}
+      </button>
+    </div>
+  );
+}
+
+function StatsTab({notes}) {
+  const today=todayStr();
+  const stats=useMemo(()=>{
+    if(!notes.length) return null;
+    const totalReviews=notes.flatMap(n=>n.reviews||[]);
+    const doneReviews=totalReviews.filter(r=>r.done);
+    const reviewRate=totalReviews.length?Math.round(doneReviews.length/totalReviews.length*100):0;
+    const dueNow=totalReviews.filter(r=>!r.done&&r.due<=today).length;
+    const partData=Object.entries(ALL_PARTS).map(([k,v])=>({name:v.label,count:notes.filter(n=>n.partKey===k).length,color:partColor(k)})).filter(d=>d.count>0);
+    const lcNotes=notes.filter(n=>isLC(n.partKey));
+    const rcNotes=notes.filter(n=>!isLC(n.partKey));
+    const lcTypeData=LC_TYPES.map(t=>({name:t.label,value:lcNotes.filter(n=>(n.types||[]).includes(t.key)).length,color:t.color})).filter(d=>d.value>0);
+    const rcTypeData=RC_TYPES.map(t=>({name:t.label,value:rcNotes.filter(n=>(n.types||[]).includes(t.key)).length,color:t.color})).filter(d=>d.value>0);
+    const dateMap={};
+    for(let i=13;i>=0;i--){dateMap[addDays(today,-i)]=0;}
+    notes.forEach(n=>{const d=n.reviews?.[0]?.due?addDays(n.reviews[0].due,-1):null;if(d&&dateMap[d]!==undefined)dateMap[d]++;});
+    const trendData=Object.entries(dateMap).map(([date,count])=>({date:fmtDate(date),count}));
+    const know=doneReviews.filter(r=>r.result==="know").length;
+    const unsure=doneReviews.filter(r=>r.result==="unsure").length;
+    const forget=doneReviews.filter(r=>r.result==="forget").length;
+    return {totalReviews,doneReviews,reviewRate,dueNow,partData,lcTypeData,rcTypeData,trendData,know,unsure,forget};
+  },[notes,today]);
+  if(!stats) return <div style={s.empty}><div style={{fontSize:36,marginBottom:10}}>📊</div>데이터가 없어요.<br/><span style={{fontSize:12,color:"#ffffff25"}}>오답을 추가하면 통계가 표시돼요.</span></div>;
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}}>
+        {[{label:"총 오답",value:notes.length,unit:"문제",color:"#6366f1"},{label:"복습 완료율",value:`${stats.reviewRate}%`,unit:"",color:"#10b981"},{label:"복습 대기",value:stats.dueNow,unit:"개",color:stats.dueNow>0?"#f59e0b":"#ffffff40"},{label:"복습 완료",value:stats.doneReviews.length,unit:"회",color:"#a78bfa"}].map(c=>(
+          <div key={c.label} style={{background:"#ffffff05",border:`1px solid ${c.color}25`,borderRadius:10,padding:"14px 12px",textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:800,color:c.color}}>{c.value}<span style={{fontSize:11,color:"#ffffff40"}}>{c.unit}</span></div>
+            <div style={{fontSize:11,color:"#ffffff40",marginTop:3}}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+      {stats.doneReviews.length>0&&(<div style={{background:"#ffffff05",border:"1px solid #ffffff10",borderRadius:12,padding:"14px",marginBottom:12}}><div style={{fontSize:12,color:"#ffffff60",marginBottom:10,fontWeight:600}}>🎯 SRS 복습 정확도</div><div style={{display:"flex",gap:8}}>{[{label:"알았어요",value:stats.know,color:"#10b981",emoji:"✅"},{label:"애매해요",value:stats.unsure,color:"#f59e0b",emoji:"🤔"},{label:"몰랐어요",value:stats.forget,color:"#e94560",emoji:"❌"}].map(b=><div key={b.label} style={{flex:1,textAlign:"center",padding:"10px 6px",borderRadius:8,background:b.color+"12",border:`1px solid ${b.color}30`}}><div style={{fontSize:20}}>{b.emoji}</div><div style={{fontSize:18,fontWeight:800,color:b.color,marginTop:4}}>{b.value}</div><div style={{fontSize:10,color:"#ffffff50",marginTop:2}}>{b.label}</div></div>)}</div></div>)}
+      <div style={{background:"#ffffff05",border:"1px solid #ffffff10",borderRadius:12,padding:"14px",marginBottom:12}}><div style={{fontSize:12,color:"#ffffff60",marginBottom:10,fontWeight:600}}>📋 파트별 오답 수</div><ResponsiveContainer width="100%" height={170}><BarChart data={stats.partData} margin={{top:4,right:4,left:-20,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke="#ffffff08"/><XAxis dataKey="name" tick={{fill:"#ffffff50",fontSize:10}} axisLine={false} tickLine={false}/><YAxis tick={{fill:"#ffffff30",fontSize:10}} axisLine={false} tickLine={false} allowDecimals={false}/><Tooltip contentStyle={{background:"#1a1a2e",border:"1px solid #ffffff15",borderRadius:8,fontSize:12}} labelStyle={{color:"#e8e8f0"}} itemStyle={{color:"#6366f1"}}/><Bar dataKey="count" name="오답 수" radius={[4,4,0,0]}>{stats.partData.map((d,i)=><Cell key={i} fill={d.color}/>)}</Bar></BarChart></ResponsiveContainer></div>
+      <div style={{background:"#ffffff05",border:"1px solid #ffffff10",borderRadius:12,padding:"14px",marginBottom:12}}><div style={{fontSize:12,color:"#ffffff60",marginBottom:10,fontWeight:600}}>📈 최근 14일 추가 추이</div><ResponsiveContainer width="100%" height={140}><LineChart data={stats.trendData} margin={{top:4,right:4,left:-20,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke="#ffffff08"/><XAxis dataKey="date" tick={{fill:"#ffffff40",fontSize:9}} axisLine={false} tickLine={false} interval={2}/><YAxis tick={{fill:"#ffffff30",fontSize:10}} axisLine={false} tickLine={false} allowDecimals={false}/><Tooltip contentStyle={{background:"#1a1a2e",border:"1px solid #ffffff15",borderRadius:8,fontSize:12}} labelStyle={{color:"#e8e8f0"}} itemStyle={{color:"#6366f1"}}/><Line type="monotone" dataKey="count" name="추가 수" stroke="#6366f1" strokeWidth={2} dot={{r:3,fill:"#6366f1"}} activeDot={{r:5}}/></LineChart></ResponsiveContainer></div>
+      {stats.lcTypeData.length>0&&(<div style={{background:"#ffffff05",border:"1px solid #ffffff10",borderRadius:12,padding:"14px",marginBottom:12}}><div style={{fontSize:12,color:"#ffffff60",marginBottom:10,fontWeight:600}}>🎧 LC 오류 유형</div><div style={{display:"flex",alignItems:"center",gap:12}}><div style={{flexShrink:0}}><ResponsiveContainer width={130} height={130}><PieChart><Pie data={stats.lcTypeData} cx="50%" cy="50%" innerRadius={38} outerRadius={58} paddingAngle={3} dataKey="value">{stats.lcTypeData.map((d,i)=><Cell key={i} fill={d.color}/>)}</Pie><Tooltip contentStyle={{background:"#1a1a2e",border:"1px solid #ffffff15",borderRadius:8,fontSize:12}} itemStyle={{color:"#fff"}}/></PieChart></ResponsiveContainer></div><div style={{flex:1}}>{stats.lcTypeData.map(d=><div key={d.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5}}><div style={{display:"flex",alignItems:"center",gap:5}}><div style={{width:8,height:8,borderRadius:"50%",background:d.color}}/><span style={{fontSize:12,color:"#e8e8f0aa"}}>{d.name}</span></div><span style={{fontSize:12,fontWeight:700,color:d.color}}>{d.value}</span></div>)}</div></div></div>)}
+      {stats.rcTypeData.length>0&&(<div style={{background:"#ffffff05",border:"1px solid #ffffff10",borderRadius:12,padding:"14px",marginBottom:12}}><div style={{fontSize:12,color:"#ffffff60",marginBottom:10,fontWeight:600}}>📖 RC 오류 유형</div><ResponsiveContainer width="100%" height={Math.max(160,stats.rcTypeData.length*26)}><BarChart data={stats.rcTypeData} layout="vertical" margin={{top:4,right:30,left:10,bottom:0}}><CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" horizontal={false}/><XAxis type="number" tick={{fill:"#ffffff30",fontSize:10}} axisLine={false} tickLine={false} allowDecimals={false}/><YAxis type="category" dataKey="name" tick={{fill:"#ffffff60",fontSize:10}} axisLine={false} tickLine={false} width={60}/><Tooltip contentStyle={{background:"#1a1a2e",border:"1px solid #ffffff15",borderRadius:8,fontSize:12}} itemStyle={{color:"#f59e0b"}}/><Bar dataKey="value" name="오답 수" radius={[0,4,4,0]}>{stats.rcTypeData.map((d,i)=><Cell key={i} fill={d.color}/>)}</Bar></BarChart></ResponsiveContainer></div>)}
+    </div>
+  );
+}
+
+function AutoTextarea({value,onChange,placeholder}){
+  const ref=useRef();
+  useEffect(()=>{if(ref.current){ref.current.style.height="auto";ref.current.style.height=ref.current.scrollHeight+"px";}},[value]);
+  return <textarea ref={ref} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={{...s.inp,resize:"none",lineHeight:1.6,overflow:"hidden",minHeight:60}}/>;
+}
+function Sec({title,color,children}){return <div style={{marginBottom:16}}><div style={{fontSize:11,fontWeight:600,color:color||"#ffffff50",letterSpacing:.5,marginBottom:7}}>{title}</div>{children}</div>;}
+function Chip({label,color}){return <span style={{fontSize:10,color,background:color+"20",padding:"2px 8px",borderRadius:20,fontWeight:700}}>{label}</span>;}
+
+const s={
+  root:{minHeight:"100vh",background:"#0a0a0f",color:"#e8e8f0",fontFamily:"'Pretendard','Noto Sans KR',sans-serif"},
+  hdr:{background:"linear-gradient(135deg,#0a0a0f,#1a1a2e,#0a0a0f)",borderBottom:"1px solid #ffffff10",padding:"16px",position:"sticky",top:0,zIndex:10,backdropFilter:"blur(12px)"},
+  hdrIn:{maxWidth:500,margin:"0 auto",display:"flex",justifyContent:"space-between",alignItems:"center"},
+  tabBar:{display:"flex",borderBottom:"1px solid #ffffff10",background:"#0a0a0f",position:"sticky",top:57,zIndex:9},
+  tabBtn:{flex:1,background:"none",border:"none",borderBottom:"2px solid transparent",padding:"10px 4px",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2},
+  body:{maxWidth:500,margin:"0 auto",padding:"14px 14px 80px"},
+  btn:{border:"none",borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:600,cursor:"pointer",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",gap:6},
+  inp:{width:"100%",background:"#ffffff08",border:"1px solid #ffffff15",borderRadius:8,padding:"10px 12px",color:"#e8e8f0",fontSize:13,outline:"none",boxSizing:"border-box",fontFamily:"inherit"},
+  sel:{background:"#ffffff08",border:"1px solid #ffffff15",borderRadius:8,padding:"7px 10px",color:"#e8e8f0",fontSize:12,outline:"none"},
+  toast:{padding:"10px 14px",borderRadius:8,border:"1px solid",fontSize:12,marginBottom:12},
+  examRow:{width:"100%",background:"#ffffff08",border:"1px solid #ffffff12",borderRadius:10,padding:"11px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",color:"#e8e8f0",marginBottom:5},
+  partRow:{width:"100%",border:"1px solid",borderRadius:8,padding:"8px 12px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",color:"#e8e8f0",marginBottom:3},
+  empty:{textAlign:"center",padding:"60px 20px",color:"#ffffff35",fontSize:14,lineHeight:2},
+  qText:{background:"#ffffff08",borderRadius:8,padding:"14px",fontSize:18,color:"#e8e8f0",whiteSpace:"pre-wrap",lineHeight:2,fontFamily:"inherit",overflowX:"auto",letterSpacing:"0.3px"},
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
